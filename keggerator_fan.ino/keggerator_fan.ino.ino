@@ -24,7 +24,7 @@ OneWire oneWire(D4);
 DallasTemperature keggeratorSensor(&oneWire);
 unsigned long lastReadingTime = 0, lastPostTime = 0;
 float currentReading;
-float desiredTemperature = 43.5;
+float desiredTemperature = 42.0;
 unsigned int runningCount = 0;
 unsigned int waitCount = 0;
 
@@ -48,13 +48,13 @@ void setup() {
     httpServer.send(200, "text/html", html);
   });
   WiFiManager wifiManager;
-  wifiManager.autoConnect("KeggeratorFan");
+  wifiManager.autoConnect(host);
   // Hostname defaults to esp8266-[ChipID]
- WiFi.hostname(host);
+  WiFi.hostname(host);
   if (!MDNS.begin(host)) {
     Serial.println("Error setting up MDNS responder!");
   }
-  ArduinoOTA.setHostname("keggeratorfan");
+  ArduinoOTA.setHostname(host);
   ArduinoOTA.onStart([]() {
     String type;
     if (ArduinoOTA.getCommand() == U_FLASH)
