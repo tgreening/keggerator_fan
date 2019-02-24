@@ -8,25 +8,41 @@
 #include <DallasTemperature.h>
 #include <SPI.h>
 #include <Wire.h>
+#include <FS.h>                   //this needs to be first, or it all crashes and burns...
+#include <ArduinoJson.h>          //https://github.com/bblanchon/ArduinoJson
+#include <ThingSpeak.h>
 
 const unsigned long READ_MILLIS = 5000UL;
 const unsigned long POST_MILLIS = 300000UL;
-const int RUN_COUNT = 2;
-const int WAIT_COUNT = 3;
-const String apiKey = "QBU7IXR9SLBQIJV5";
+const unsigned long RUNNING_MILLIS = 60000UL;
+const unsigned long NEXT_RUN = 1200000UL;
+int RAN = false;
+
 const char* thingSpeakserver = "api.thingspeak.com";
 const int FAN_PIN = D1;
-const char* host = "kegerator_fan";
+const char* host = "kegeratorfan";
 
 ESP8266WebServer httpServer(80);
 // Setup a oneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
 OneWire oneWire(D4);
 DallasTemperature keggeratorSensor(&oneWire);
-unsigned long lastReadingTime = 0, lastPostTime = 0;
+unsigned long lastReadingTime = 0, lastPostTime = 0, lastRunCheck = 0, lastRunTime = 0;
 float currentReading;
 float desiredTemperature = 42.0;
 unsigned int runningCount = 0;
 unsigned int waitCount = 0;
+char tsAPIKey[40];
+char tsChannel[6];
+String proxyAPIKey = "";
+
+//flag for saving data
+bool shouldSaveConfig = false;
+
+//callback notifying us of the need to save config
+void saveConfigCallback () {
+  Serial.println("Should save config");
+  shouldSaveConfig = true;
+}
 
 void setup() {
   Serial.begin(115200);
@@ -43,14 +59,90 @@ void setup() {
     html += runningCount;
     html += "<br>Wait Time: ";
     html += waitCount;
-    html += "<br></body></html>";
+    html += "<br>API Key: ";
+    html += String(tsAPIKey);
+    html += "<br>Channel: ";
+    html += String(tsChannel);
+    html += "~<br></body></html>";
     Serial.println("Done serving up HTML...");
     httpServer.send(200, "text/html", html);
   });
   WiFiManager wifiManager;
-  wifiManager.autoConnect(host);
-  // Hostname defaults to esp8266-[ChipID]
-  WiFi.hostname(host);
+  WiFi.hostname(String(host));
+  String holder = "";
+  if (SPIFFS.begin()) {
+    Serial.println("mounted file system");
+    if (SPIFFS.exists("/config.json")) {
+      //file exists, reading and loading
+      Serial.println("reading config file");
+      File configFile = SPIFFS.open("/config.json", "r");
+      if (configFile) {
+        Serial.println("opened config file");
+        size_t size = configFile.size();
+        // Allocate a buffer to store contents of the file.
+        std::unique_ptr<char[]> buf(new char[size]);
+
+        configFile.readBytes(buf.get(), size);
+        DynamicJsonBuffer jsonBuffer;
+        JsonObject& json = jsonBuffer.parseObject(buf.get());
+        json.printTo(Serial);
+        if (json.success()) {
+          Serial.println("\nparsed json");
+          holder = json["ThingSpeakWriteKey"].asString();
+          strcpy(tsChannel, json["ThingSpeakChannel"]);
+          Serial.println(holder);
+          Serial.println(tsChannel);
+        } else {
+          Serial.println("failed to load json config");
+        }
+      }
+    }
+  } else {
+    Serial.println("failed to mount FS");
+  }
+  holder.toCharArray(tsAPIKey, 40);
+  Serial.println(tsAPIKey);
+  WiFiManagerParameter custom_thingspeak_api_key("key", "API key", tsAPIKey, 40);
+  WiFiManagerParameter custom_thingspeak_channel("ThingSpeak Channel", "Channel Number", tsChannel, 8);
+  wifiManager.setSaveConfigCallback(saveConfigCallback);
+
+  //add all your parameters here
+  wifiManager.addParameter(&custom_thingspeak_api_key);
+  wifiManager.addParameter(&custom_thingspeak_channel);
+
+  wifiManager.setConfigPortalTimeout(90);
+  if (!wifiManager.startConfigPortal(host)) {
+    Serial.println("failed to connect and hit timeout");
+    delay(3000);
+    //reset and try again, or maybe put it to deep sleep
+    ESP.reset();
+    delay(5000);
+  }
+
+  //save the custom parameters to FS
+  if (shouldSaveConfig) {
+    Serial.println("saving config");
+    DynamicJsonBuffer jsonBuffer;
+    JsonObject& json = jsonBuffer.createObject();
+    json["ThingSpeakWriteKey"] = (String)custom_thingspeak_api_key.getValue();
+    json["ThingSpeakChannel"] = (String)custom_thingspeak_channel.getValue();
+
+    File configFile = SPIFFS.open("/config.json", "w");
+    if (!configFile) {
+      Serial.println("failed to open config file for writing");
+    }
+
+    json.printTo(Serial);
+    json.printTo(configFile);
+    configFile.close();
+    //end save
+  }
+  Serial.print("Api Key: ");
+  Serial.println(tsAPIKey);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
   if (!MDNS.begin(host)) {
     Serial.println("Error setting up MDNS responder!");
   }
@@ -83,66 +175,67 @@ void setup() {
   Serial.println("Ready");
   Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
+  WiFi.mode(WIFI_STA);
   httpServer.begin();
   pinMode(FAN_PIN, OUTPUT);
   digitalWrite(FAN_PIN, LOW);
   lastPostTime = millis() + POST_MILLIS;
+  lastRunTime = millis() + RUNNING_MILLIS;
+  strcpy(tsAPIKey, custom_thingspeak_api_key.getValue());
+  proxyAPIKey = (String)tsAPIKey;
+  Serial.println(tsAPIKey);
+  Serial.println(proxyAPIKey);
+  Serial.println(custom_thingspeak_api_key.getValue());
+  strcpy(tsChannel, custom_thingspeak_channel.getValue());
+  Serial.println(tsChannel);
 }
 
 void loop() {
-
   if ((long) (millis() - lastReadingTime) >= 0) {
     lastReadingTime += READ_MILLIS;
     keggeratorSensor.requestTemperatures(); // Send the command to get temperatures
     currentReading = getReading(keggeratorSensor);
     if ((long)(millis() - lastPostTime) >= 0) {
-      if (currentReading > desiredTemperature && runningCount < RUN_COUNT && waitCount == 0) {
-        digitalWrite(FAN_PIN, HIGH);
-        runningCount++;
+      if (RAN) {
         postData(currentReading, 1);
-        waitCount = 0;
       } else {
-        digitalWrite(FAN_PIN, LOW);
-        if (waitCount < WAIT_COUNT) {
-          waitCount++;
-        } else {
-          waitCount = 0;
-        }
         postData(currentReading, 0);
-        runningCount = 0;
       }
-      Serial.println("Updating checks...");
+      RAN =false;
       lastPostTime += POST_MILLIS;
     }
+    if (millis() - lastRunTime > 0 ) {
+      if ( (currentReading > desiredTemperature) & !RAN) {
+        digitalWrite(FAN_PIN, HIGH);
+        lastRunTime = millis() + RUNNING_MILLIS;
+        RAN = true;
+        Serial.println("Running");
+      } else {
+        digitalWrite(FAN_PIN, LOW);
+        lastRunTime = millis() + NEXT_RUN;
+        Serial.println("Stopping");
+      }
+    }
+    Serial.print(".");
   }
   ArduinoOTA.handle();
   httpServer.handleClient();
 }
-
 void postData(float reading, float runTime) {
-  String data = apiKey + "&field1=";
-  data += reading;
-  data += "&field2=";
-  data += runTime;
-  data += "\r\n\r\n";
-  postToThingSpeak(data);
-}
-
-void postToThingSpeak(String data) {
   WiFiClient client;
-  if (client.connect(thingSpeakserver, 80)) { // "184.106.153.149" or api.thingspeak.com
-
-    client.print("POST /update HTTP/1.1\n");
-    client.print("Host: api.thingspeak.com\n");
-    client.print("Connection: close\n");
-    client.print("X-THINGSPEAKAPIKEY: " + apiKey + "\n");
-    client.print("Content-Type: application/x-www-form-urlencoded\n");
-    client.print("Content-Length: ");
-    client.print(data.length());
-    client.print("\n\n");
-    client.print(data);
-  }
+  ThingSpeak.begin(client);  // Initialize ThingSpeak
+  Serial.println("About to post!");
+  Serial.print("Channel: ");
+  Serial.println(atoi(tsChannel));
+  Serial.print("API Key: ");
+  proxyAPIKey.toCharArray(tsAPIKey, 17);
+  Serial.println(tsAPIKey);
+  ThingSpeak.setField(1, reading);
+  ThingSpeak.setField(2, runTime);
+  int x = ThingSpeak.writeFields(atoi(tsChannel), tsAPIKey);
+  Serial.println(x);
 }
+
 
 float getReading(DallasTemperature sensor) {
   int retryCount = 0;
